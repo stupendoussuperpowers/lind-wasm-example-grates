@@ -38,7 +38,7 @@ int geteuid_grate(uint64_t cageid) {
 int main(int argc, char *argv[]) {
   // Should be at least two inputs (at least one grate file and one cage file)
   if (argc < 2) {
-    fprintf(stderr, "Usage: %s <cage_file> <grate_file> <cage_file> [...]\n",
+    fprintf(stderr, "Usage: %s <cage_file>\n",
             argv[0]);
     exit(EXIT_FAILURE);
   }
@@ -53,32 +53,35 @@ int main(int argc, char *argv[]) {
   // - the second is when there is still at least one grate in the subsequent
   // command line input. In the second case, we fork & exec the new grate and
   // let the new grate handle the subsequent process.
-  for (int i = 1; i < (argc < 3 ? argc : 3); i++) {
-    pid_t pid = fork();
-    if (pid < 0) {
-      perror("fork failed");
-      exit(EXIT_FAILURE);
-    } else if (pid == 0) {
-      // According to input format, the odd-numbered positions will always be
-      // grate, and even-numbered positions will always be cage.
-      if (i % 2 != 0) {
-        // Next one is cage, only set the register_handler when next one is cage
-        int cageid = getpid();
-        // Set the geteuid (syscallnum=107) of this cage to call this grate
-        // function geteuid_grate (func index=0) Syntax of register_handler:
-        // <targetcage, targetcallnum, handlefunc_flag (deregister(0) or register
-        // (non-zero), this_grate_id, fn_ptr_u64)>
-        uint64_t fn_ptr_addr = (uint64_t)(uintptr_t)&geteuid_grate;
-        printf("[Grate|geteuid] Registering geteuid handler for cage %d in "
-               "grate %d with fn ptr addr: %llu\n",
-               cageid, grateid, fn_ptr_addr);
-        int ret = register_handler(cageid, 107, 1, grateid, fn_ptr_addr);
-      }
+  pid_t pid = fork();
+  if (pid < 0) {
+    perror("fork failed");
+    exit(EXIT_FAILURE);
+  } else if (pid == 0) {
+    // Only set the register_handler for the cage 
+    int cageid = getpid();
+    // Set the geteuid (syscallnum=107) of this cage to call this grate
+    // function geteuid_grate (func index=0). 
+    // Syntax of register_handler:
+    //
+    // int register_handler(
+    //   uint64_t targetcage,       - Cage ID (cageid)
+    //   uint64_t targetcallnum,    - Syscall Number (107 for geteuid)
+    //   uint64_t handlefunc_flag,  - 0 for deregister, non-0 for register
+    //   uint64_t this_grate_id,    - Grate ID (grateid)
+    //   uint64_t optional_arg      - Function pointer for the custom handler (&geteuid_grate)
+    // );
+    //
 
-      if (execv(argv[i], &argv[i]) == -1) {
-        perror("execv failed");
-        exit(EXIT_FAILURE);
-      }
+    uint64_t fn_ptr_addr = (uint64_t)(uintptr_t)&geteuid_grate;
+    printf("[Grate|geteuid] Registering geteuid handler for cage %d in "
+           "grate %d with fn ptr addr: %llu\n",
+           cageid, grateid, fn_ptr_addr);
+    int ret = register_handler(cageid, 107, 1, grateid, fn_ptr_addr);
+  
+    if (execv(argv[1], &argv[1]) == -1) {
+      perror("execv failed");
+      exit(EXIT_FAILURE);
     }
   }
 
