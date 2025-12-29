@@ -16,7 +16,7 @@
 #define MAX_NODE_NAME 65
 #define MAX_NODE_SIZE 4096
 #define MAX_FDS		  1024
-#define MAX_NODES	  1024
+#define MAX_NODES	  10 
 #define MAX_DEPTH	  10
 #define MAX_PROCS	  128
 
@@ -31,13 +31,14 @@ typedef struct FileDesc FileDesc;
 typedef struct Pipe Pipe;
 typedef struct Chunk Chunk;
 
+// Used for pathconf(3) 
 static int PC_CONSTS[] = {
 	0,
 	10,
 	10,
 	10,
-	MAX_NODE_NAME - 1,
-	MAX_DEPTH *MAX_NODE_NAME,
+	MAX_NODE_NAME - 1, // _PC_NAME_MAX
+	MAX_DEPTH *MAX_NODE_NAME, // _PC_PATH_MAX
 	10,
 	10,
 	10,
@@ -69,9 +70,8 @@ typedef struct DirEnt {
 typedef struct Node {
 	NodeType type;
 	int index;	 /* Index in the global g_nodes */
-	size_t size; /* Size for offset related calls. */
 
-	size_t total_size;
+	size_t total_size; /* Total size of a reg file */
 
 	char name[MAX_NODE_NAME]; /* File name */
 	// struct Node *parent;	  /* Parent node */
@@ -79,6 +79,9 @@ typedef struct Node {
 	int in_use; /* Number of FD's attached to this node */
 	int doomed;
 	mode_t mode;
+
+	uid_t owner;
+	gid_t group;
 
 	struct timespec atime;
 	struct timespec mtime;
@@ -88,9 +91,8 @@ typedef struct Node {
 	union {
 		// M_REG
 		struct {
-			char *data; /* File contents stored as a char array */
-			Chunk *head;
-			Chunk *tail;
+			Chunk *head; /* First data node */
+			Chunk *tail; /* Last data node */
 		} reg;
 
 		// M_LNK
@@ -101,7 +103,7 @@ typedef struct Node {
 		// M_DIR
 		struct {
 			struct DirEnt children[MAX_NODES]; /* Directory contents. */
-			size_t count;					   /* len(children) including . and .. */
+			size_t count; /* len(children) including . and .. */
 		} dir;
 
 		// M_PIP
@@ -109,8 +111,8 @@ typedef struct Node {
 			Pipe *pipe;
 		} pip;
 	} info;
-
 } Node;
+
 typedef struct FileDesc {
 	int status;
 	int flags;
@@ -137,6 +139,7 @@ typedef struct Pipe {
 	off_t offset;
 } Pipe;
 
+// Data for reg files is stored in Chunks of size 1024 bytes, there are connected through a linked list.
 typedef struct Chunk {
 	char data[1024];
 	size_t used;
@@ -192,9 +195,6 @@ int imfs_fpathconf(int cage_id, int fd, int name);
 
 int imfs_pipe(int cage_id, int pipefd[2]);
 int imfs_pipe2(int cage_id, int pipefd[2], int flags);
-
-ssize_t imfs_new_write(int cage_id, int fd, const void *buf, size_t count);
-ssize_t imfs_new_read(int cage_id, int fd, void *buf, size_t count);
 
 int imfs_fcntl(int cage_id, int fd, int op, int arg);
 

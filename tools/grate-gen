@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+
+from dataclasses import dataclass
+
+import clang.cindex
+from clang.cindex import CursorKind, TypeKind, TranslationUnit
+
+from typing import List, Optional
+
+
+SIGNATURE = """{return_type} {func_name}_grate(
+uint64_t cageid,
+uint64_t arg1, uint64_t arg1cage,
+uint64_t arg2, uint64_t arg2cage,
+uint64_t arg3, uint64_t arg3cage,
+uint64_t arg4, uint64_t arg4cage,
+uint64_t arg5, uint64_t arg5cage,
+uint64_t arg6, uint64_t arg6cage) {{
+
+    int thiscage = getpid();
+
+    {extract}
+
+    {allocs}
+
+    {copy_in}
+
+    {return_type} ret = {func_name}({param_list});
+
+    {copy_out}
+
+    {free_code}
+
+    return ret;
+}}
+"""
+
+ALLOC = """
+{type_str} {name} = malloc({size});
+
+if({name} == NULL) {{
+    perror("malloc failed");
+    return -1;
+}}
+"""
+
+COPY = """
+copy_data_between_cages(
+    thiscage,
+    {targetcage},
+    {src},
+    {srccage},
+    {dest},
+    {destcage},
+    {len},
+    {copytype}
+);
+"""
+
+REGISTER_HANDLERS = """
+void register_handlers(int cageid, int grateid) {{
+    {handlers}
+}}
+"""
+
+REGISTER_HANDLER = """
+register_handler(cageid, {sysnum}, 1, grateid, (uint64_t)(uintptr_t)&{name}_grate);
+"""
+
+DEFAULTS = """
+// Dispatcher function
+int pass_fptr_to_wt(uint64_t fn_ptr_uint, uint64_t cageid, uint64_t arg1,
+                    uint64_t arg1cage, uint64_t arg2, uint64_t arg2cage,
+                    uint64_t arg3, uint64_t arg3cage, uint64_t arg4,
+                    uint64_t arg4cage, uint64_t arg5, uint64_t arg5cage,
+                    uint64_t arg6, uint64_t arg6cage) {
+  if (fn_ptr_uint == 0) {
+    return -1;
+  }
+
+  int (*fn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+            uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+            uint64_t) =
+      (int (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+               uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+               uint64_t))(uintptr_t)fn_ptr_uint;
+
+  return fn(cageid, arg1, arg1cage, arg2, arg2cage, arg3, arg3cage, arg4,
+            arg4cage, arg5, arg5cage, arg6, arg6cage);
+}
+
+int main(int argc, char *argv[]) {
+  if (argc < 2) {
+    fprintf(stderr, "Usage: %s <cage_file>\\n", argv[0]);
+    exit(EXIT_FAILURE);
+  }
+
+  int grateid = getpid();
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    perror("fork failed");
+    exit(EXIT_FAILURE);
+  } else if (pid == 0) {
+    int cageid = getpid();
+    register_handlers(cageid, grateid);
+
+    if (execv(argv[1], &argv[1]) == -1) {
+      perror("execv failed");
+      exit(EXIT_FAILURE);
+    }
+  } else {
+    grate_init();
+  }
+
+  int status;
+  while (wait(&status) > 0) {
+    grate_destroy();
+  }
+
+  return 0;
+}
+"""
+
+
+@dataclass
+class ParamInfo:
+    name: str
+    type_str: str
+    is_pointer: bool
+    index: int
+    direction: Optional[str]
+    size: Optional[str]
+
+    def from_arg(arg, idx):
+        direction, size = None, None
+
+        for child in arg.get_children():
+            if child.kind == CursorKind.ANNOTATE_ATTR:
+                text = child.spelling
+                direction, size = text.split(":")
+                break
+
+        return ParamInfo(
+            name=arg.spelling or f"arg{idx}",
+            type_str=arg.type.spelling,
+            is_pointer=arg.type.kind == TypeKind.POINTER,
+            direction=direction,
+            size=size,
+            index=idx
+        )
+
+
+@dataclass
+class FunctionInfo:
+    name: str
+    return_type: str
+    params: List[ParamInfo]
+
+    def from_cursor(cursor):
+        func_name = cursor.spelling
+        return_type = cursor.result_type.spelling
+
+        params = []
+
+        for i, arg in enumerate(cursor.get_arguments()):
+            params.append(ParamInfo.from_arg(arg, i))
+
+        return FunctionInfo(
+            name=func_name,
+            return_type=return_type,
+            params=params
+        )
+
+    def generate_decl(self):
+        params = []
+
+        for i, param in enumerate(self.params):
+            params.append(f"{param.type_str}")
+
+        params = ','.join(params)
+
+        return f"{self.return_type} {self.name}({params});"
+
+    def generate_wrapper(self):
+        extract = []
+        copy_in = []
+        copy_out = []
+        free_code = []
+        allocs = []
+
+        param_list = []
+
+        for i, param in enumerate(self.params):
+            param_list.append(f"{param.name}")
+
+            if i == 0:
+                continue
+
+            if not param.direction:
+                extract.append(f"{param.type_str} {
+                               param.name} = arg{param.index};")
+            else:
+                allocs.append(ALLOC.format(
+                    type_str=param.type_str,
+                    name=param.name,
+                    size=param.size))
+
+                if "in" in param.direction:
+                    free_code.append(f"free({param.name});")
+
+                    copy_in.append(COPY.format(
+                        targetcage=f"arg{param.index}cage",
+                        src=f"arg{param.index}",
+                        srccage=f"arg{param.index}cage",
+                        dest=f"(uint64_t){param.name}",
+                        destcage="thiscage",
+                        len=f"{param.size}",
+                        copytype=1 if param.size == 256 else 0,
+                        type_str=param.type_str,
+                        name=param.name,
+                        size=param.size))
+
+                if "out" in param.direction:
+                    free_code.append(f"free({param.name});")
+
+                    copy_out.append(COPY.format(
+                        targetcage=f"arg{param.index}cage",
+                        dest=f"arg{param.index}",
+                        destcage=f"arg{param.index}cage",
+                        src=f"(uint64_t){param.name}",
+                        srccage="thiscage",
+                        len=f"{param.size}",
+                        copytype=1 if param.size == 256 else 0,
+                        type_str=param.type_str,
+                        name=param.name,
+                        size=param.size))
+
+        return SIGNATURE.format(
+            return_type=f"{self.return_type}",
+            func_name=f"{self.name}",
+            extract=''.join(extract),
+            allocs=''.join(allocs),
+            copy_in=''.join(copy_in),
+            copy_out=''.join(copy_out),
+            free_code=''.join(free_code),
+            param_list=','.join(param_list)
+        )
+
+
+def get_handlers() -> List[FunctionInfo]:
+    seen = set()
+
+    def check_handler(cursor):
+        for child in cursor.get_children():
+            if child.kind == CursorKind.ANNOTATE_ATTR:
+                if 'syscall' in child.spelling.lower():
+                    sysnum = child.spelling.lower().split(":")[-1]
+                    handler_table[sysnum] = cursor.spelling
+                    return True
+        return False
+
+    def visit_node(cursor, lst):
+        if cursor.kind == CursorKind.FUNCTION_DECL and check_handler(cursor):
+            if cursor.spelling not in seen:
+                lst.append(cursor)
+                seen.add(cursor.spelling)
+        for child in cursor.get_children():
+            visit_node(child, lst)
+
+    a = []
+
+    visit_node(tu.cursor, a)
+
+    return [FunctionInfo.from_cursor(i) for i in a]
+
+
+def generate_registers():
+    registers = []
+
+    for k, v in handler_table.items():
+        registers.append(REGISTER_HANDLER.format(
+            sysnum=k, name=v
+        ))
+
+    return REGISTER_HANDLERS.format(handlers=''.join(registers))
+
+
+def get_includes(tu):
+    includes = []
+
+    main_file = tu.spelling
+
+    for i in tu.cursor.get_children():
+        if i.kind == CursorKind.INCLUSION_DIRECTIVE:
+            loc = i.location
+            if not loc.file or loc.file.name != main_file:
+                continue
+            tks = ""
+            for tk in i.get_tokens():
+                tks += tk.spelling
+            includes.append(tks)
+
+    return includes
+
+
+clang.cindex.Config.set_library_file(
+    '/home/lind/lind-wasm/clang+llvm-18.1.8-x86_64-linux-gnu-ubuntu-18.04/lib/libclang.so')
+
+handler_table = {}
+
+index = clang.cindex.Index.create()
+
+input_file = sys.argv[1]  # 'test.c'
+
+tu = index.parse(input_file, args=['-I/usr/include', '-std=c11'],
+                 options=TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
+
+
+functions = ""
+decl = ""
+for i in get_handlers():
+    functions += i.generate_wrapper()
+    decl += i.generate_decl()
+
+functions += generate_registers()
+
+
+FILE = """/* Auto-generated: DO NOT MODIFY */
+
+{includes}
+
+extern void grate_init(void);
+extern void grate_destroy(void);
+
+{decl}
+
+{wrappers}
+
+{templated_funcs}
+
+"""
+
+includes = """
+#include <lind_syscall.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+"""
+
+includes += '\n'.join(get_includes(tu))
+
+with open("src/tmp.c", "w") as out:
+    out.write(FILE.format(
+        includes=includes,
+        decl=decl,
+        wrappers=functions,
+        templated_funcs=DEFAULTS  # template_funcs
+    ))
